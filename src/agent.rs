@@ -1,6 +1,7 @@
 use crate::config::ModelRouting;
 use crate::llm::{ChatMessage, LlmClient};
 use crate::tools::ToolExecutor;
+use crate::ui::{self, Tone};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -14,6 +15,12 @@ const PARALLEL_RESULT_PROMPT: &str =
     "Parallel tool execution result:\n{result}\n\nContinue. If the task is complete, respond with a final message.";
 const DELEGATE_RESULT_PROMPT: &str =
     "Delegated subtask result:\n{result}\n\nContinue. If the task is complete, respond with a final message.";
+const PLAN_ACK_PROMPT: &str =
+    "Plan recorded:\n{plan}\n\nExecute the task now. Use tools or delegation when needed. Before finishing, check for missed work, verify important changes, and then respond with a final handoff.";
+const PLAN_REQUIRED_PROMPT: &str =
+    "Before using tools, delegating, or finishing, first respond with a JSON object of type='plan' that says whether a detailed plan is needed, what the summary is, and which steps you will take.";
+const INVALID_JSON_PROMPT: &str =
+    "Your last reply was not a valid JSON object. Respond with exactly one JSON object and no markdown.";
 
 #[derive(Clone, Debug)]
 struct AgentSession {
@@ -26,6 +33,64 @@ struct AgentSession {
 struct Action {
     action_type: String,
     payload: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TaskPlan {
+    pub needs_plan: bool,
+    pub summary: String,
+    pub reason: String,
+    pub steps: Vec<String>,
+    pub focus: Vec<String>,
+}
+
+impl TaskPlan {
+    fn as_feedback_block(&self) -> String {
+        let mut lines = vec![
+            format!("needs_plan: {}", self.needs_plan),
+            format!("summary: {}", self.summary),
+        ];
+        if !self.reason.is_empty() {
+            lines.push(format!("reason: {}", self.reason));
+        }
+        if !self.focus.is_empty() {
+            lines.push(format!("focus: {}", self.focus.join(" | ")));
+        }
+        if !self.steps.is_empty() {
+            lines.push("steps:".to_string());
+            for (index, step) in self.steps.iter().enumerate() {
+                lines.push(format!("{}. {}", index + 1, step));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TaskHandoff {
+    pub message: String,
+    pub summary: String,
+    pub completed: Vec<String>,
+    pub verified: Vec<String>,
+    pub missed: Vec<String>,
+    pub next_steps: Vec<String>,
+}
+
+impl TaskHandoff {
+    pub fn summary_or_message(&self) -> String {
+        if !self.summary.trim().is_empty() {
+            return self.summary.trim().to_string();
+        }
+        self.message.trim().to_string()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RunSummary {
+    pub agent_name: String,
+    pub user_prompt: String,
+    pub plan: Option<TaskPlan>,
+    pub handoff: Option<TaskHandoff>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +113,7 @@ pub struct Orchestrator {
     active_agent: String,
     delegate_counter: u64,
     show_tool_events: bool,
+    last_run_summary: Option<RunSummary>,
 }
 
 impl Orchestrator {
@@ -74,6 +140,7 @@ impl Orchestrator {
             active_agent: "main".to_string(),
             delegate_counter: 0,
             show_tool_events,
+            last_run_summary: None,
         };
         this.ensure_agent("main");
         this
@@ -85,6 +152,10 @@ impl Orchestrator {
 
     pub fn model_routing(&self) -> Value {
         self.routing.as_json()
+    }
+
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
     }
 
     pub fn list_agents(&self) -> Vec<String> {
@@ -125,12 +196,14 @@ impl Orchestrator {
 
     pub fn run_active(&mut self, user_prompt: &str) -> String {
         let active = self.active_agent.clone();
+        self.begin_run_summary(&active, user_prompt);
         self.run_with_depth(&active, user_prompt, 0, self.max_steps)
     }
 
     pub fn run_with_agent(&mut self, name: &str, user_prompt: &str) -> Result<String> {
         let normalized = normalize_agent_name(name)?;
         self.ensure_agent(&normalized);
+        self.begin_run_summary(&normalized, user_prompt);
         Ok(self.run_with_depth(&normalized, user_prompt, 0, self.max_steps))
     }
 
@@ -143,12 +216,31 @@ impl Orchestrator {
         })
     }
 
+    pub fn last_run_summary(&self) -> Option<&RunSummary> {
+        self.last_run_summary.as_ref()
+    }
+
     pub fn reload_plugins(&mut self) -> String {
         let result = self
             .tools
             .execute("reload_plugins", &json!({}), &self.routing.as_json());
         self.refresh_all_system_prompts();
         result
+    }
+
+    pub fn set_workspace(
+        &mut self,
+        workspace_root: PathBuf,
+        memory_file: PathBuf,
+        plugins_dir: PathBuf,
+    ) -> Result<PathBuf> {
+        let root = self
+            .tools
+            .set_workspace(workspace_root, memory_file, plugins_dir)
+            .map_err(|err| anyhow!(err))?;
+        self.workspace_root = root.display().to_string();
+        self.refresh_all_system_prompts();
+        Ok(root)
     }
 
     pub fn session_payload(&self) -> Value {
@@ -222,6 +314,37 @@ impl Orchestrator {
             .unwrap_or(0);
 
         Ok(source)
+    }
+
+    fn begin_run_summary(&mut self, agent_name: &str, user_prompt: &str) {
+        self.last_run_summary = Some(RunSummary {
+            agent_name: agent_name.to_string(),
+            user_prompt: user_prompt.trim().to_string(),
+            plan: None,
+            handoff: None,
+        });
+    }
+
+    fn update_root_plan(&mut self, depth: u32, agent_name: &str, plan: TaskPlan) {
+        if depth != 0 {
+            return;
+        }
+        if let Some(summary) = self.last_run_summary.as_mut() {
+            if summary.agent_name == agent_name {
+                summary.plan = Some(plan);
+            }
+        }
+    }
+
+    fn update_root_handoff(&mut self, depth: u32, agent_name: &str, handoff: TaskHandoff) {
+        if depth != 0 {
+            return;
+        }
+        if let Some(summary) = self.last_run_summary.as_mut() {
+            if summary.agent_name == agent_name {
+                summary.handoff = Some(handoff);
+            }
+        }
     }
 
     fn restore_agents_from_payload(&self, payload: &Value) -> HashMap<String, AgentSession> {
@@ -369,7 +492,7 @@ impl Orchestrator {
     fn system_prompt_for(&self, agent_name: &str) -> String {
         let tool_specs = self.tools.render_specs_for_prompt();
         format!(
-            "You are LocalCodex, a terminal coding assistant.\n\nYou can use tools to inspect and modify files, run shell commands, and orchestrate sub-agents.\nOnly use tools when needed.\n\nWorkspace root:\n{}\n\nCurrent agent name:\n{}\n\nAvailable tools JSON:\n{}\n\nResponse rules:\n1) Always respond with exactly one JSON object and no surrounding markdown.\n2) Use one of these shapes:\n   - {{\"type\": \"tool\", \"tool\": \"<tool_name>\", \"args\": {{...}}, \"reason\": \"short reason\"}}\n   - {{\"type\": \"parallel_tools\", \"calls\": [{{\"tool\": \"<tool>\", \"args\": {{...}}}}], \"max_workers\": 4, \"reason\": \"short reason\"}}\n   - {{\"type\": \"delegate\", \"prompt\": \"subtask prompt\", \"agent_name\": \"optional_named_agent\", \"max_steps\": 6, \"reason\": \"short reason\"}}\n   - {{\"type\": \"final\", \"message\": \"final user-facing response\"}}\n3) If a tool errors, adapt and continue.\n4) Prefer minimal, safe changes that satisfy the request.\n5) Keep delegate depth <= {}.\n",
+            "You are LocalCodex, a terminal coding assistant.\n\nYou can use tools to inspect and modify files, run shell commands, and orchestrate sub-agents.\nOnly use tools when needed.\n\nWorkspace root:\n{}\n\nCurrent agent name:\n{}\n\nAvailable tools JSON:\n{}\n\nScope rules:\n1) The workspace root above is the default operating boundary.\n2) Start from files inside this directory only.\n3) Do not assume parent directories, sibling directories, or repo-wide context are relevant unless the user explicitly asks to widen scope.\n4) Keep edits and investigation focused on the current directory scope whenever possible.\n\nWorkflow rules:\n1) Every task must start by deciding whether it needs a plan.\n2) Your first valid action for a task must be:\n   {{\"type\": \"plan\", \"needs_plan\": true|false, \"summary\": \"what you will do\", \"reason\": \"why this does or does not need a detailed plan\", \"steps\": [\"specific step\", \"specific step\"], \"focus\": [\"optional focus area\"]}}\n3) Use needs_plan=true for multi-step, risky, unclear, or multi-file work. Use needs_plan=false only for direct tasks, but still include 1-3 concrete steps.\n4) After the plan, execute with tools, parallel tools, or delegation as needed.\n5) Before finishing, review whether anything is missing and verify the important parts.\n6) End with:\n   {{\"type\": \"final\", \"message\": \"user-facing handoff\", \"summary\": \"short completion summary\", \"completed\": [\"what got done\"], \"verified\": [\"checks you performed\"], \"missed\": [\"remaining gaps or follow-ups\"], \"next_steps\": [\"optional next step\"]}}\n\nResponse rules:\n1) Always respond with exactly one JSON object and no surrounding markdown.\n2) Use one of these shapes:\n   - {{\"type\": \"plan\", \"needs_plan\": true|false, \"summary\": \"...\", \"reason\": \"...\", \"steps\": [\"...\"], \"focus\": [\"...\"]}}\n   - {{\"type\": \"tool\", \"tool\": \"<tool_name>\", \"args\": {{...}}, \"reason\": \"short reason\"}}\n   - {{\"type\": \"parallel_tools\", \"calls\": [{{\"tool\": \"<tool>\", \"args\": {{...}}}}], \"max_workers\": 4, \"reason\": \"short reason\"}}\n   - {{\"type\": \"delegate\", \"prompt\": \"subtask prompt\", \"agent_name\": \"optional_named_agent\", \"max_steps\": 6, \"reason\": \"short reason\"}}\n   - {{\"type\": \"final\", \"message\": \"final user-facing response\", \"summary\": \"short summary\", \"completed\": [\"...\"], \"verified\": [\"...\"], \"missed\": [\"...\"], \"next_steps\": [\"...\"]}}\n3) If a tool errors, adapt and continue.\n4) Prefer minimal, safe changes that satisfy the request.\n5) Keep delegate depth <= {}.\n",
             self.workspace_root, agent_name, tool_specs, self.max_delegation_depth,
         )
     }
@@ -391,6 +514,7 @@ impl Orchestrator {
         );
 
         let step_limit = max_steps.max(1);
+        let mut has_plan = false;
 
         for step in 0..step_limit {
             let role = if step == 0 {
@@ -410,12 +534,24 @@ impl Orchestrator {
                 .map(|session| session.messages.clone())
                 .unwrap_or_default();
 
+            let activity_label = if !has_plan {
+                "plan"
+            } else if depth > 0 {
+                "delegate"
+            } else {
+                "work"
+            };
+            let activity_message = format!("{agent_name} · {}", preview(user_prompt, 64));
+            let activity = ui::start_activity(activity_label, &activity_message, Tone::Accent);
+
             let model_response = match self.llm.chat(&model, &messages, self.temperature) {
                 Ok(value) => value,
                 Err(err) => {
+                    activity.finish("llm error", Tone::Danger);
                     return format!("I hit an LLM error while using model '{model}': {err}");
                 }
             };
+            activity.finish("response ready", Tone::Info);
 
             let action = Self::parse_action(&model_response);
             let Some(action) = action else {
@@ -426,7 +562,19 @@ impl Orchestrator {
                         content: model_response.clone(),
                     },
                 );
-                return model_response.trim().to_string();
+                let correction = if has_plan {
+                    INVALID_JSON_PROMPT.to_string()
+                } else {
+                    format!("{INVALID_JSON_PROMPT}\n\n{PLAN_REQUIRED_PROMPT}")
+                };
+                self.append_message(
+                    agent_name,
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: correction,
+                    },
+                );
+                continue;
             };
 
             let payload_text =
@@ -440,20 +588,58 @@ impl Orchestrator {
             );
 
             match action.action_type.as_str() {
-                "final" => {
-                    let message = action
-                        .payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if message.is_empty() {
-                        return "I do not have a final message yet.".to_string();
+                "plan" => {
+                    let plan = Self::parse_plan(&action.payload);
+                    has_plan = true;
+                    self.update_root_plan(depth, agent_name, plan.clone());
+                    if self.show_tool_events {
+                        ui::print_plan(agent_name, &plan);
                     }
+                    self.append_message(
+                        agent_name,
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: PLAN_ACK_PROMPT.replace("{plan}", &plan.as_feedback_block()),
+                        },
+                    );
+                }
+                "final" => {
+                    if !has_plan {
+                        self.append_message(
+                            agent_name,
+                            ChatMessage {
+                                role: "user".to_string(),
+                                content: PLAN_REQUIRED_PROMPT.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    let handoff = Self::parse_handoff(&action.payload);
+                    let message = handoff.summary_or_message();
+                    if message.is_empty() {
+                        self.append_message(
+                            agent_name,
+                            ChatMessage {
+                                role: "user".to_string(),
+                                content: "Final responses must include at least a non-empty message or summary.".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    self.update_root_handoff(depth, agent_name, handoff);
                     return message;
                 }
                 "tool" => {
+                    if !has_plan {
+                        self.append_message(
+                            agent_name,
+                            ChatMessage {
+                                role: "user".to_string(),
+                                content: PLAN_REQUIRED_PROMPT.to_string(),
+                            },
+                        );
+                        continue;
+                    }
                     let result = self.handle_tool_action(agent_name, &action.payload);
                     self.append_message(
                         agent_name,
@@ -464,6 +650,16 @@ impl Orchestrator {
                     );
                 }
                 "parallel_tools" => {
+                    if !has_plan {
+                        self.append_message(
+                            agent_name,
+                            ChatMessage {
+                                role: "user".to_string(),
+                                content: PLAN_REQUIRED_PROMPT.to_string(),
+                            },
+                        );
+                        continue;
+                    }
                     let result = self.handle_parallel_action(agent_name, &action.payload);
                     self.append_message(
                         agent_name,
@@ -474,6 +670,16 @@ impl Orchestrator {
                     );
                 }
                 "delegate" => {
+                    if !has_plan {
+                        self.append_message(
+                            agent_name,
+                            ChatMessage {
+                                role: "user".to_string(),
+                                content: PLAN_REQUIRED_PROMPT.to_string(),
+                            },
+                        );
+                        continue;
+                    }
                     let result =
                         self.handle_delegate_action(agent_name, &action.payload, depth, step_limit);
                     self.append_message(
@@ -485,10 +691,13 @@ impl Orchestrator {
                     );
                 }
                 _ => {
-                    self.append_message(agent_name, ChatMessage {
-                        role: "user".to_string(),
-                        content: "Invalid action type. Respond with JSON using type='tool', type='parallel_tools', type='delegate', or type='final'.".to_string(),
-                    });
+                    self.append_message(
+                        agent_name,
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: "Invalid action type. Respond with JSON using type='plan', type='tool', type='parallel_tools', type='delegate', or type='final'.".to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -641,6 +850,72 @@ impl Orchestrator {
         result
     }
 
+    fn parse_plan(payload: &Map<String, Value>) -> TaskPlan {
+        let mut steps = Self::parse_string_list(payload.get("steps"));
+        if steps.is_empty() {
+            if let Some(reason) = payload.get("reason").and_then(Value::as_str) {
+                steps.push(reason.trim().to_string());
+            }
+        }
+
+        TaskPlan {
+            needs_plan: payload
+                .get("needs_plan")
+                .and_then(Value::as_bool)
+                .unwrap_or(!steps.is_empty() && steps.len() > 1),
+            summary: payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Work the task")
+                .trim()
+                .to_string(),
+            reason: payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            steps,
+            focus: Self::parse_string_list(payload.get("focus")),
+        }
+    }
+
+    fn parse_handoff(payload: &Map<String, Value>) -> TaskHandoff {
+        TaskHandoff {
+            message: payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            summary: payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            completed: Self::parse_string_list(payload.get("completed")),
+            verified: Self::parse_string_list(payload.get("verified")),
+            missed: Self::parse_string_list(payload.get("missed")),
+            next_steps: Self::parse_string_list(payload.get("next_steps")),
+        }
+    }
+
+    fn parse_string_list(value: Option<&Value>) -> Vec<String> {
+        value
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     fn next_delegate_name(&mut self, depth: u32) -> String {
         loop {
             self.delegate_counter += 1;
@@ -671,7 +946,12 @@ impl Orchestrator {
 
     fn emit_tool_event(&self, message: &str) {
         if self.show_tool_events {
-            println!("[tool] {message}");
+            let tone = if message.contains("ERROR") || message.contains("error") {
+                Tone::Warning
+            } else {
+                Tone::Info
+            };
+            ui::print_event("tool", tone, message);
         }
     }
 

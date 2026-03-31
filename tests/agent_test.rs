@@ -64,12 +64,26 @@ fn build_orchestrator(tmp: &TempDir, llm: StubLlm) -> Orchestrator {
 fn parses_embedded_json_action() {
     let tmp = TempDir::new().expect("failed creating temp dir");
     let llm = StubLlm::new(vec![
-        "I will do this now. {\"type\":\"final\",\"message\":\"done\"}",
+        "I will do this now. {\"type\":\"plan\",\"needs_plan\":false,\"summary\":\"finish fast\",\"reason\":\"simple request\",\"steps\":[\"answer directly\"]}",
+        "{\"type\":\"final\",\"message\":\"done\",\"completed\":[\"answered the request\"],\"verified\":[\"response was produced\"],\"missed\":[]}",
     ]);
 
     let mut orchestrator = build_orchestrator(&tmp, llm);
     let result = orchestrator.run_active("do it");
     assert_eq!(result, "done");
+
+    let summary = orchestrator
+        .last_run_summary()
+        .expect("missing last run summary");
+    assert_eq!(summary.agent_name, "main");
+    assert_eq!(
+        summary
+            .plan
+            .as_ref()
+            .expect("missing recorded plan")
+            .summary,
+        "finish fast"
+    );
 }
 
 #[test]
@@ -78,8 +92,9 @@ fn executes_parallel_action_and_records_history() {
     std::fs::write(tmp.path().join("a.txt"), "hello\n").expect("failed writing a.txt");
 
     let llm = StubLlm::new(vec![
+        "{\"type\":\"plan\",\"needs_plan\":true,\"summary\":\"inspect files\",\"reason\":\"multiple reads\",\"steps\":[\"read the file\",\"list the tree\"]}",
         "```json\n{\"type\":\"parallel_tools\",\"calls\":[{\"tool\":\"read_file\",\"args\":{\"path\":\"a.txt\"}},{\"tool\":\"list_files\",\"args\":{\"path\":\".\",\"max_depth\":1}}]}\n```",
-        "{\"type\":\"final\",\"message\":\"done\"}",
+        "{\"type\":\"final\",\"message\":\"done\",\"completed\":[\"read the file\",\"listed the tree\"],\"verified\":[\"tool history recorded\"],\"missed\":[]}",
     ]);
 
     let mut orchestrator = build_orchestrator(&tmp, llm);
@@ -97,9 +112,11 @@ fn executes_parallel_action_and_records_history() {
 fn delegate_named_agent_and_session_round_trip() {
     let tmp = TempDir::new().expect("failed creating temp dir");
     let llm = StubLlm::new(vec![
+        "{\"type\":\"plan\",\"needs_plan\":true,\"summary\":\"use delegation\",\"reason\":\"split the task\",\"steps\":[\"delegate subtask\",\"combine result\"]}",
         "{\"type\":\"delegate\",\"agent_name\":\"research\",\"prompt\":\"do subtask\",\"max_steps\":2}",
-        "{\"type\":\"final\",\"message\":\"subtask done\"}",
-        "{\"type\":\"final\",\"message\":\"all done\"}",
+        "{\"type\":\"plan\",\"needs_plan\":false,\"summary\":\"handle delegated subtask\",\"reason\":\"small task\",\"steps\":[\"complete subtask\"]}",
+        "{\"type\":\"final\",\"message\":\"subtask done\",\"completed\":[\"finished the subtask\"],\"verified\":[\"delegate responded\"],\"missed\":[]}",
+        "{\"type\":\"final\",\"message\":\"all done\",\"completed\":[\"delegated work\",\"combined result\"],\"verified\":[\"subtask finished\"],\"missed\":[]}",
     ]);
 
     let mut orchestrator = build_orchestrator(&tmp, llm);

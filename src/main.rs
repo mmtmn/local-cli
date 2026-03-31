@@ -4,7 +4,8 @@ use local_codex::agent::Orchestrator;
 use local_codex::config::{ModelRouting, Settings};
 use local_codex::llm::{LlmClient, OllamaClient, OpenAiCompatibleClient};
 use local_codex::tools::ToolExecutor;
-use std::io::{self, Write};
+use local_codex::ui::{self, Tone};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -107,7 +108,7 @@ struct RuntimeSettings {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let runtime = build_settings(cli)?;
+    let mut runtime = build_settings(cli)?;
     let workspace = runtime.settings.workspace_resolved();
 
     let tools = ToolExecutor::new(
@@ -139,23 +140,25 @@ fn main() -> Result<()> {
     if let Some(path) = session_file.as_ref() {
         if path.exists() && !runtime.fresh_session {
             match orchestrator.load_session(path) {
-                Ok(loaded) => println!("Loaded session: {}", loaded.display()),
-                Err(err) => eprintln!("Warning: failed to load session {}: {err}", path.display()),
+                Ok(loaded) => ui::print_notice(&format!("loaded session: {}", loaded.display())),
+                Err(err) => {
+                    ui::print_warning(&format!("failed to load session {}: {err}", path.display()))
+                }
             }
         } else if path.exists() && runtime.fresh_session {
-            println!(
-                "Starting fresh session. Ignoring existing file: {}",
+            ui::print_notice(&format!(
+                "starting fresh session and ignoring existing file: {}",
                 path.display()
-            );
+            ));
         }
     }
 
     if let Some(prompt) = runtime.prompt.as_deref() {
-        run_once(&mut orchestrator, prompt, session_file.as_deref())?;
+        run_once(&mut orchestrator, &runtime, prompt, session_file.as_deref())?;
         return Ok(());
     }
 
-    repl(&mut orchestrator, session_file.as_deref())
+    repl(&mut orchestrator, &mut runtime, session_file.as_deref())
 }
 
 fn build_settings(cli: Cli) -> Result<RuntimeSettings> {
@@ -231,31 +234,50 @@ fn build_llm(settings: &Settings) -> Result<Box<dyn LlmClient>> {
 
 fn run_once(
     orchestrator: &mut Orchestrator,
+    runtime: &RuntimeSettings,
     prompt: &str,
     session_file: Option<&Path>,
 ) -> Result<()> {
     let response = orchestrator.run_active(prompt);
-    println!("{response}");
+    render_response(orchestrator, &response);
     if let Some(path) = session_file {
         orchestrator.save_session(path)?;
     }
+    let _ = runtime;
     Ok(())
 }
 
-fn repl(orchestrator: &mut Orchestrator, session_file: Option<&Path>) -> Result<()> {
-    println!("local interactive mode");
-    println!("Commands: /exit, /quit, /reset, /save [path], /load [path], /reload_plugins");
-    println!("Agent commands: /agents, /agent list|new <name>|use <name>|run <name> <prompt>|reset <name>");
-    println!("Model routing: /models or /routing");
+fn repl(
+    orchestrator: &mut Orchestrator,
+    runtime: &mut RuntimeSettings,
+    session_file: Option<&Path>,
+) -> Result<()> {
+    let workspace = runtime.settings.workspace_resolved();
+    ui::print_welcome(
+        &workspace,
+        &runtime.settings.provider,
+        &runtime.settings.routing,
+        runtime.settings.auto_mode,
+        session_file,
+    );
+    ui::print_help();
 
     loop {
-        print!("you> ");
-        io::stdout().flush().ok();
+        print!(
+            "{}",
+            ui::prompt(
+                orchestrator.active_agent(),
+                &runtime.settings.workspace_resolved(),
+                &runtime.settings.routing,
+                runtime.settings.auto_mode
+            )
+        );
+        ui::flush_stdout();
 
         let mut line = String::new();
         let bytes = io::stdin().read_line(&mut line)?;
         if bytes == 0 {
-            println!("Exiting.");
+            ui::print_notice("exiting");
             return Ok(());
         }
 
@@ -265,7 +287,7 @@ fn repl(orchestrator: &mut Orchestrator, session_file: Option<&Path>) -> Result<
         }
 
         if input.starts_with('/') {
-            let action = handle_command(input, orchestrator, session_file)?;
+            let action = handle_command(input, orchestrator, runtime, session_file)?;
             if action == ReplControl::Exit {
                 return Ok(());
             }
@@ -274,7 +296,7 @@ fn repl(orchestrator: &mut Orchestrator, session_file: Option<&Path>) -> Result<
         }
 
         let response = orchestrator.run_active(input);
-        println!("assistant> {response}");
+        render_response(orchestrator, &response);
         maybe_save_session(orchestrator, session_file);
     }
 }
@@ -282,34 +304,52 @@ fn repl(orchestrator: &mut Orchestrator, session_file: Option<&Path>) -> Result<
 fn handle_command(
     input: &str,
     orchestrator: &mut Orchestrator,
+    runtime: &mut RuntimeSettings,
     session_file: Option<&Path>,
 ) -> Result<ReplControl> {
     let (command, rest) = split_command(input);
 
     match command {
+        "/help" => ui::print_help(),
         "/exit" | "/quit" => return Ok(ReplControl::Exit),
         "/reset" => {
             orchestrator.reset_active()?;
-            println!("assistant> reset agent '{}'", orchestrator.active_agent());
+            ui::print_notice(&format!("reset agent '{}'", orchestrator.active_agent()));
         }
         "/save" => {
             let target = command_path_or_default(rest, session_file)?;
             let saved = orchestrator.save_session(target)?;
-            println!("assistant> session saved: {}", saved.display());
+            ui::print_notice(&format!("session saved: {}", saved.display()));
         }
         "/load" => {
             let target = command_path_or_default(rest, session_file)?;
             let loaded = orchestrator.load_session(target)?;
-            println!("assistant> session loaded: {}", loaded.display());
+            ui::print_notice(&format!("session loaded: {}", loaded.display()));
         }
         "/reload_plugins" => {
             let result = orchestrator.reload_plugins();
-            println!("assistant> {result}");
+            ui::print_assistant_message(orchestrator.active_agent(), &result);
+        }
+        "/status" => {
+            print_status(orchestrator, runtime, session_file);
+        }
+        "/plan" => {
+            if let Some(plan) = orchestrator
+                .last_run_summary()
+                .and_then(|summary| summary.plan.as_ref())
+            {
+                ui::print_last_plan(plan);
+            } else {
+                ui::print_warning("no recorded plan for this session yet");
+            }
+        }
+        "/scope" => {
+            handle_scope_command(rest, orchestrator, runtime)?;
         }
         "/models" | "/routing" => {
             let payload = serde_json::to_string_pretty(&orchestrator.model_routing())
                 .unwrap_or_else(|_| "{}".to_string());
-            println!("assistant> {payload}");
+            ui::print_panel("ROUTING", Tone::Info, &[payload]);
         }
         "/agents" => {
             print_agent_list(orchestrator);
@@ -318,7 +358,7 @@ fn handle_command(
             handle_agent_command(rest, orchestrator, session_file)?;
         }
         _ => {
-            println!("assistant> error: unknown command {command}");
+            ui::print_warning(&format!("unknown command {command}"));
         }
     }
 
@@ -338,19 +378,19 @@ fn handle_agent_command(
 
     if let Some(name) = trimmed.strip_prefix("new ") {
         orchestrator.create_agent(name.trim())?;
-        println!("assistant> created agent '{}'", name.trim());
+        ui::print_notice(&format!("created agent '{}'", name.trim()));
         return Ok(());
     }
 
     if let Some(name) = trimmed.strip_prefix("use ") {
         orchestrator.set_active_agent(name.trim())?;
-        println!("assistant> active agent: {}", orchestrator.active_agent());
+        ui::print_notice(&format!("active agent: {}", orchestrator.active_agent()));
         return Ok(());
     }
 
     if let Some(name) = trimmed.strip_prefix("reset ") {
         orchestrator.reset_agent(name.trim())?;
-        println!("assistant> reset agent '{}'", name.trim());
+        ui::print_notice(&format!("reset agent '{}'", name.trim()));
         return Ok(());
     }
 
@@ -360,17 +400,17 @@ fn handle_agent_command(
         let prompt = split.next().unwrap_or("").trim();
 
         if name.is_empty() || prompt.is_empty() {
-            println!("assistant> error: usage /agent run <name> <prompt>");
+            ui::print_warning("usage: /agent run <name> <prompt>");
             return Ok(());
         }
 
         let response = orchestrator.run_with_agent(name, prompt)?;
-        println!("assistant> [{name}] {response}");
+        render_response(orchestrator, &response);
         maybe_save_session(orchestrator, session_file);
         return Ok(());
     }
 
-    println!("assistant> error: unknown /agent command");
+    ui::print_warning("unknown /agent command");
     Ok(())
 }
 
@@ -379,18 +419,11 @@ fn print_agent_list(orchestrator: &Orchestrator) {
     let names = orchestrator.list_agents();
 
     if names.is_empty() {
-        println!("assistant> no agents");
+        ui::print_warning("no agents");
         return;
     }
 
-    println!("assistant> agents:");
-    for name in names {
-        if name == active {
-            println!("  * {} (active)", name);
-        } else {
-            println!("  * {}", name);
-        }
-    }
+    ui::print_agents(&active, &names);
 }
 
 fn maybe_save_session(orchestrator: &mut Orchestrator, session_file: Option<&Path>) {
@@ -399,11 +432,72 @@ fn maybe_save_session(orchestrator: &mut Orchestrator, session_file: Option<&Pat
     };
 
     if let Err(err) = orchestrator.save_session(path) {
-        eprintln!(
-            "assistant> warning: failed to save session {}: {err}",
-            path.display()
-        );
+        ui::print_warning(&format!("failed to save session {}: {err}", path.display()));
     }
+}
+
+fn render_response(orchestrator: &Orchestrator, fallback: &str) {
+    if let Some(summary) = orchestrator.last_run_summary() {
+        if let Some(handoff) = summary.handoff.as_ref() {
+            ui::print_handoff(&summary.agent_name, handoff);
+            return;
+        }
+    }
+
+    ui::print_assistant_message(orchestrator.active_agent(), fallback);
+}
+
+fn print_status(
+    orchestrator: &Orchestrator,
+    runtime: &RuntimeSettings,
+    session_file: Option<&Path>,
+) {
+    ui::print_status(
+        &runtime.settings.workspace_resolved(),
+        &runtime.settings.provider,
+        &runtime.settings.routing,
+        orchestrator.active_agent(),
+        runtime.settings.auto_mode,
+        session_file,
+        orchestrator.last_run_summary(),
+    );
+}
+
+fn handle_scope_command(
+    rest: &str,
+    orchestrator: &mut Orchestrator,
+    runtime: &mut RuntimeSettings,
+) -> Result<()> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        ui::print_scope(&runtime.settings.workspace_resolved());
+        return Ok(());
+    }
+
+    if let Some(path) = trimmed.strip_prefix("use ") {
+        let current = runtime.settings.workspace_resolved();
+        let target = resolve_scope_path(&current, path.trim())?;
+        if !target.is_dir() {
+            return Err(anyhow!(
+                "scope target is not a directory: {}",
+                target.display()
+            ));
+        }
+
+        runtime.settings.workspace = target.clone();
+        let new_workspace = runtime.settings.workspace_resolved();
+        let updated = orchestrator.set_workspace(
+            new_workspace.clone(),
+            runtime.settings.memory_file_resolved(),
+            runtime.settings.plugins_dir_resolved(),
+        )?;
+        ui::print_notice(&format!("scope changed to {}", updated.display()));
+        ui::print_scope(&updated);
+        return Ok(());
+    }
+
+    ui::print_warning("usage: /scope or /scope use <path>");
+    Ok(())
 }
 
 fn split_command(input: &str) -> (&str, &str) {
@@ -447,6 +541,18 @@ fn resolve_path(base: &Path, value: PathBuf) -> PathBuf {
     } else {
         base.join(value)
     }
+}
+
+fn resolve_scope_path(base: &Path, raw: &str) -> Result<PathBuf> {
+    let expanded = expand_user_path(raw);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+    candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve scope path {}", candidate.display()))
 }
 
 fn default_endpoint(provider: Provider) -> &'static str {

@@ -241,6 +241,30 @@ impl ToolExecutor {
         serde_json::to_string_pretty(&self.list_specs()).unwrap_or_else(|_| "[]".to_string())
     }
 
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub fn set_workspace(
+        &mut self,
+        workspace_root: PathBuf,
+        memory_file: PathBuf,
+        plugins_dir: PathBuf,
+    ) -> Result<PathBuf, String> {
+        let root = workspace_root
+            .canonicalize()
+            .map_err(|err| format!("failed to resolve workspace: {err}"))?;
+        if !root.is_dir() {
+            return Err(format!("workspace is not a directory: {}", root.display()));
+        }
+
+        self.workspace_root = root.clone();
+        self.memory_file = memory_file;
+        self.plugins_dir = plugins_dir;
+        self.plugins = self.load_plugins();
+        Ok(root)
+    }
+
     pub fn execute(&mut self, tool_name: &str, args: &Value, model_routing: &Value) -> String {
         if tool_name == "reload_plugins" {
             self.plugins = self.load_plugins();
@@ -875,7 +899,9 @@ impl ToolExecutor {
             .arg(&self.workspace_root)
             .arg("status")
             .arg("--short")
-            .arg("--branch");
+            .arg("--branch")
+            .arg("--")
+            .arg(".");
 
         match self.run_process(&mut cmd, None) {
             Ok(result) => self.format_process_output(result),
@@ -906,6 +932,8 @@ impl ToolExecutor {
             };
             let rel = self.to_workspace_rel_path(&resolved);
             cmd.arg("--").arg(rel);
+        } else {
+            cmd.arg("--").arg(".");
         }
 
         match self.run_process(&mut cmd, None) {
@@ -933,7 +961,9 @@ impl ToolExecutor {
             .arg("--oneline")
             .arg("--decorate")
             .arg("-n")
-            .arg(safe_count.to_string());
+            .arg(safe_count.to_string())
+            .arg("--")
+            .arg(".");
 
         match self.run_process(&mut cmd, None) {
             Ok(result) => self.format_process_output(result),
@@ -950,7 +980,9 @@ impl ToolExecutor {
         cmd.arg("-C")
             .arg(&self.workspace_root)
             .arg("status")
-            .arg("--porcelain=1");
+            .arg("--porcelain=1")
+            .arg("--")
+            .arg(".");
 
         let result = match self.run_process(&mut cmd, None) {
             Ok(value) => value,
@@ -1054,7 +1086,9 @@ impl ToolExecutor {
                 .arg("-C")
                 .arg(&self.workspace_root)
                 .arg("add")
-                .arg("-A");
+                .arg("-A")
+                .arg("--")
+                .arg(".");
             let add_result = match self.run_process(&mut add_cmd, None) {
                 Ok(value) => value,
                 Err(err) => return format!("ERROR: {err}"),
@@ -1077,7 +1111,9 @@ impl ToolExecutor {
             .arg(&self.workspace_root)
             .arg("commit")
             .arg("-m")
-            .arg(message);
+            .arg(message)
+            .arg("--")
+            .arg(".");
 
         match self.run_process(&mut commit_cmd, None) {
             Ok(result) => self.format_process_output(result),

@@ -3,12 +3,14 @@
 `local-cli` is a Rust, open-source coding orchestrator for local/open LLM backends.
 
 It is designed as a practical local alternative focused on useful core workflows:
+- plan-first task execution with explicit review and handoff
 - multi-model routing by role (`text`, `planner`, `coder`, `image`)
 - named agents and delegated subtasks
 - git-aware coding tools
 - persistent memory and session save/load
 - structured code editing tools
 - plugin-style external tools
+- terminal UI with richer status, plan, and handoff rendering
 - auto mode by default (no approval prompts)
 
 No skills, MCP integration, or external sandbox layer are built in.
@@ -16,9 +18,18 @@ No skills, MCP integration, or external sandbox layer are built in.
 ## Features
 
 ### Orchestration
-- JSON action loop with tool calls, parallel tool calls, and delegation.
+- JSON action loop with a required `plan -> execute -> review -> handoff` lifecycle.
+- Plan-first behavior for every task, including a `needs_plan` decision and concrete steps.
+- Structured final handoff with completed work, verification, and remaining gaps.
 - Named agents (`/agent new`, `/agent use`, `/agent run`) for task decomposition.
 - Delegation depth control with `--max-delegation-depth`.
+
+### Terminal UX
+- Startup dashboard showing workspace, routing, approvals, and session state.
+- Prompt bar that surfaces active agent, scope, model, and approval mode.
+- Animated planning/work spinners while the model is thinking.
+- Styled plan panels, live tool-event logs, and final handoff panels.
+- Status commands for quickly checking current session state, scope, and the last plan.
 
 ### Tooling
 - File tools: `list_files`, `read_file`, `write_file`, `replace_in_file`.
@@ -78,6 +89,11 @@ cargo run --bin local-cli -- \
 
 ## Interactive Commands
 
+- `/help`
+- `/status`
+- `/plan`
+- `/scope`
+- `/scope use <path>`
 - `/exit`, `/quit`
 - `/reset`
 - `/save [path]`
@@ -90,6 +106,26 @@ cargo run --bin local-cli -- \
 - `/agent use <name>`
 - `/agent run <name> <prompt>`
 - `/agent reset <name>`
+
+## Task Lifecycle
+
+For each prompt, `local-cli` now drives the model through the same loop:
+
+1. Decide whether a detailed plan is needed.
+2. Record specific steps and focus areas.
+3. Execute with tools, parallel reads, and delegation where useful.
+4. Review for missed work and verify important changes.
+5. Return a structured handoff.
+
+This makes the CLI behave more like modern coding agents instead of a plain REPL.
+
+## Scope Behavior
+
+`local-cli` treats the launch directory as its default operating boundary.
+
+- If you start it in `./test`, file reads, writes, patches, shell commands, and git-aware planning stay scoped to `./test`.
+- Repo-aware git commands are also limited to the current scope instead of defaulting to the whole repository.
+- If you want to widen or change scope during a session, use `/scope use <path>`.
 
 ## Session Persistence
 

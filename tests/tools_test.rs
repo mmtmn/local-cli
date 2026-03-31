@@ -168,6 +168,43 @@ fn git_tools_and_patch_workflow() {
 }
 
 #[test]
+fn git_tools_respect_workspace_scope() {
+    let tmp = TempDir::new().expect("failed creating temp dir");
+    let repo = tmp.path().join("repo");
+    let workspace = repo.join("app");
+    fs::create_dir_all(&workspace).expect("failed creating workspace");
+
+    run_checked(&["git", "init", "-b", "main"], &repo);
+    run_checked(&["git", "config", "user.email", "test@example.com"], &repo);
+    run_checked(&["git", "config", "user.name", "Test User"], &repo);
+
+    fs::write(repo.join("root.txt"), "root\n").expect("failed writing root.txt");
+    fs::write(workspace.join("local.txt"), "local\n").expect("failed writing local.txt");
+    run_checked(&["git", "add", "."], &repo);
+    run_checked(&["git", "commit", "-m", "init"], &repo);
+
+    fs::write(repo.join("root.txt"), "root changed\n").expect("failed updating root.txt");
+    fs::write(workspace.join("local.txt"), "local changed\n").expect("failed updating local.txt");
+
+    let plugins_dir = workspace.join(".local_codex").join("plugins");
+    fs::create_dir_all(&plugins_dir).expect("failed creating plugins dir");
+    let memory_file = workspace.join(".local_codex").join("memory.json");
+    let mut executor = ToolExecutor::new(workspace.clone(), true, 30, memory_file, plugins_dir);
+
+    let status = executor.execute("git_status", &json!({}), &routing_json());
+    assert!(status.contains("local.txt"));
+    assert!(!status.contains("root.txt"));
+
+    let diff = executor.execute("git_diff", &json!({}), &routing_json());
+    assert!(diff.contains("local changed"));
+    assert!(!diff.contains("root changed"));
+
+    let plan = executor.execute("git_commit_plan", &json!({}), &routing_json());
+    assert!(plan.contains("local.txt"));
+    assert!(!plan.contains("root.txt"));
+}
+
+#[test]
 fn memory_lifecycle() {
     let mut harness = Harness::new();
 
